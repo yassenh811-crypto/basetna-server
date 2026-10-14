@@ -1,25 +1,23 @@
 /* ============================================================
    🖥️ server.js — سيرفر Basetna English
    ------------------------------------------------------------
-   - بيقرأ المفاتيح من .env
-   - نظام تدوير ذكي: لو مفتاح خلص، يروح للتاني
-   - التحقق من تسجيل الدخول (Supabase)
-   - /api/ai              → المساعد الذكي
-   - /api/generate-quiz   → توليد امتحانات من الدروس
-   - /api/health          → فحص الحالة
+   - المساعد الذكي (AI)
+   - توليد الامتحانات
+   - السيرفر الوسيط للفيديوهات (Google Drive Stream)
    ============================================================ */
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import { google } from 'googleapis';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
-app.use(express.static(__dirname));
 
 /* ============================================================
-   🔑 جمع كل المفاتيح من .env
+   🔑 مفاتيح Gemini
    ============================================================ */
 function loadApiKeys() {
   const keys = [];
@@ -30,7 +28,6 @@ function loadApiKeys() {
     if (key.trim() && !key.includes('...')) keys.push(key.trim());
     i++;
   }
-  /* دعم للمفتاح القديم GEMINI_API_KEY (لو موجود) */
   if (process.env.GEMINI_API_KEY && !keys.includes(process.env.GEMINI_API_KEY)) {
     keys.unshift(process.env.GEMINI_API_KEY);
   }
@@ -40,67 +37,41 @@ function loadApiKeys() {
 const API_KEYS = loadApiKeys();
 const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-if (API_KEYS.length === 0) {
-  console.error('❌ خطأ: مفيش أي مفتاح Gemini');
-  process.exit(1);
-}
-
 console.log(`🔑 عدد المفاتيح: ${API_KEYS.length}`);
 console.log(`🤖 الموديل: ${MODEL_NAME}`);
 
 /* ============================================================
-   🔐 التحقق من تسجيل الدخول (Supabase)
+   🔐 Supabase
    ============================================================ */
-const SUPABASE_URL =
-  process.env.SUPABASE_URL || 'https://wgostqkywpybmzgbyzeo.supabase.co';
-const SUPABASE_ANON_KEY =
-  process.env.SUPABASE_ANON_KEY ||
-  'sb_publishable_zx0zeWR2bpbmyO90oN-4ow_FxZCSPl8';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wgostqkywpybmzgbyzeo.supabase.co';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'sb_publishable_zx0zeWR2bpbmyO90oN-4ow_FxZCSPl8';
 
 async function verifyUser(req) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.replace('Bearer ', '').trim();
   if (!token) return null;
-
   try {
     const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-      headers: {
-        apikey: SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${token}`,
-      },
+      headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
     return await res.json();
-  } catch (err) {
-    return null;
-  }
+  } catch { return null; }
 }
 
 /* ============================================================
-   🔄 مدير المفاتيح الذكي
+   🔄 مدير المفاتيح
    ============================================================ */
 class KeyManager {
   constructor(keys) {
     this.keys = keys;
     this.currentIndex = 0;
-    this.status = keys.map(() => ({
-      valid: true,
-      failCount: 0,
-      lastFail: null,
-      cooldownUntil: null,
-    }));
+    this.status = keys.map(() => ({ valid: true, failCount: 0, cooldownUntil: null }));
   }
-
   current() {
-    if (
-      this.status[this.currentIndex].cooldownUntil &&
-      Date.now() < this.status[this.currentIndex].cooldownUntil
-    ) {
-      this.next();
-    }
+    if (this.status[this.currentIndex].cooldownUntil && Date.now() < this.status[this.currentIndex].cooldownUntil) this.next();
     return this.keys[this.currentIndex];
   }
-
   next() {
     let tries = 0;
     do {
@@ -110,65 +81,27 @@ class KeyManager {
     } while (!this.isAvailable(this.currentIndex));
     return this.current();
   }
-
-  isAvailable(index) {
-    const s = this.status[index];
+  isAvailable(i) {
+    const s = this.status[i];
     if (!s.valid) return false;
     if (s.cooldownUntil && Date.now() < s.cooldownUntil) return false;
     return true;
   }
-
   markFailed(reason) {
     const s = this.status[this.currentIndex];
     s.failCount++;
-    s.lastFail = reason;
-
-    if (
-      reason.includes('429') ||
-      reason.includes('quota') ||
-      reason.includes('rate')
-    ) {
-      s.cooldownUntil = Date.now() + 60 * 1000;
-      console.log(`⏸️  المفتاح #${this.currentIndex + 1} في cooldown لمدة دقيقة`);
-    } else if (
-      reason.includes('API key') ||
-      reason.includes('403') ||
-      reason.includes('PERMISSION')
-    ) {
-      s.valid = false;
-      console.log(`❌ المفتاح #${this.currentIndex + 1} معطّل نهائي`);
-    } else if (s.failCount >= 5) {
-      s.cooldownUntil = Date.now() + 5 * 60 * 1000;
-    }
+    if (reason.includes('429') || reason.includes('quota') || reason.includes('rate')) s.cooldownUntil = Date.now() + 60000;
+    else if (reason.includes('API key') || reason.includes('403')) s.valid = false;
+    else if (s.failCount >= 5) s.cooldownUntil = Date.now() + 300000;
   }
-
-  markSuccess() {
-    const s = this.status[this.currentIndex];
-    s.failCount = 0;
-    s.cooldownUntil = null;
-  }
-
-  allBusy() {
-    return this.status.every((s, i) => !this.isAvailable(i));
-  }
-
-  getStatus() {
-    return this.status.map((s, i) => ({
-      index: i + 1,
-      valid: s.valid,
-      failCount: s.failCount,
-      lastFail: s.lastFail,
-      cooldown: s.cooldownUntil
-        ? Math.max(0, Math.round((s.cooldownUntil - Date.now()) / 1000)) + 's'
-        : null,
-    }));
-  }
+  markSuccess() { const s = this.status[this.currentIndex]; s.failCount = 0; s.cooldownUntil = null; }
+  allBusy() { return this.status.every((s, i) => !this.isAvailable(i)); }
 }
 
 const keyManager = new KeyManager(API_KEYS);
 
 /* ============================================================
-   📝 System Prompt للمساعد الذكي
+   📝 System Prompt
    ============================================================ */
 const SYSTEM_PROMPT = `أنت "مساعد بسّطنا الإنجليزي" — مساعد ذكي متخصص في تعليم اللغة الإنجليزية للناطقين بالعربية.
 
@@ -177,35 +110,23 @@ const SYSTEM_PROMPT = `أنت "مساعد بسّطنا الإنجليزي" — �
 - تصحيح الجمل وتوضيح الأخطاء
 - ترجمة عربي ↔ إنجليزي
 - اقتراح تمارين وأمثلة
-- مساعدة الطلاب في استخدام الموقع
 
 قواعد الرد:
 - رد بالعربية أولاً، ثم الإنجليزية عند الحاجة
-- كن ودوداً ومشجعاً
-- استخدم أمثلة عملية
-- لو السؤال مش واضح، اسأل للتوضيح`;
+- كن ودوداً ومشجعاً`;
 
 /* ============================================================
-   🤖 دالة إرسال الطلب لـ Gemini
+   🤖 askGemini
    ============================================================ */
 async function askGemini(messages) {
-  if (keyManager.allBusy()) {
-    throw new Error('ALL_KEYS_BUSY');
-  }
+  if (keyManager.allBusy()) throw new Error('ALL_KEYS_BUSY');
 
   const contents = messages.map((m) => ({
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: String(m.content || '') }],
   }));
-
-  contents.unshift({
-    role: 'user',
-    parts: [{ text: SYSTEM_PROMPT }],
-  });
-  contents.splice(1, 0, {
-    role: 'model',
-    parts: [{ text: 'تمام، أنا جاهز أساعدك في الإنجليزي.' }],
-  });
+  contents.unshift({ role: 'user', parts: [{ text: SYSTEM_PROMPT }] });
+  contents.splice(1, 0, { role: 'model', parts: [{ text: 'تمام، أنا جاهز أساعدك في الإنجليزي.' }] });
 
   let lastError = null;
   let attempts = 0;
@@ -213,226 +134,165 @@ async function askGemini(messages) {
 
   while (attempts < maxAttempts) {
     if (keyManager.allBusy()) throw new Error('ALL_KEYS_BUSY');
-
     const apiKey = keyManager.current();
-    const keyNum = keyManager.currentIndex + 1;
-
     try {
-      console.log(`🔄 محاولة بـ المفتاح #${keyNum}...`);
-
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
-
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents,
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 4096,
-          },
-        }),
+        body: JSON.stringify({ contents, generationConfig: { temperature: 0.7, maxOutputTokens: 8192 } }),
       });
-
       const data = await response.json();
-
-      if (!response.ok) {
-        const errMsg = data?.error?.message || `HTTP ${response.status}`;
-        throw new Error(errMsg);
-      }
-
+      if (!response.ok) throw new Error(data?.error?.message || `HTTP ${response.status}`);
       const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
       if (!reply) throw new Error('EMPTY_RESPONSE');
-
       keyManager.markSuccess();
-      console.log(`✅ نجح بـ المفتاح #${keyNum}`);
       return reply;
     } catch (err) {
       lastError = err;
       const msg = err.message || '';
-      console.log(`❌ فشل المفتاح #${keyNum}: ${msg.substring(0, 100)}`);
-
-      if (
-        msg.includes('API_KEY') ||
-        msg.includes('API key') ||
-        msg.includes('403') ||
-        msg.includes('429') ||
-        msg.includes('quota') ||
-        msg.includes('rate') ||
-        msg.includes('RESOURCE_EXHAUSTED') ||
-        msg.includes('PERMISSION_DENIED') ||
-        msg.includes('EMPTY_RESPONSE')
-      ) {
+      if (msg.includes('API key') || msg.includes('403') || msg.includes('429') || msg.includes('quota') || msg.includes('rate') || msg.includes('EMPTY_RESPONSE')) {
         keyManager.markFailed(msg);
-        const nextKey = keyManager.next();
-        if (!nextKey) break;
+        if (!keyManager.next()) break;
         attempts++;
         continue;
       }
-
       throw err;
     }
   }
-
   throw lastError || new Error('ALL_KEYS_BUSY');
 }
 
 /* ============================================================
-   🛣️ مسار /api/ai — المساعد الذكي
+   🛣️ /api/ai
    ============================================================ */
 app.post('/api/ai', async (req, res) => {
   try {
     const user = await verifyUser(req);
-    if (!user) {
-      return res.status(401).json({
-        code: 'LOGIN_REQUIRED',
-        error: 'سجّل دخولك الأول عشان تستخدم المساعد الذكي',
-      });
-    }
-
+    if (!user) return res.status(401).json({ code: 'LOGIN_REQUIRED', error: 'سجّل دخولك الأول' });
     const { messages } = req.body || {};
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return res
-        .status(400)
-        .json({ code: 'BAD_REQUEST', error: 'لازم تبعت messages (array)' });
-    }
-
+    if (!Array.isArray(messages) || messages.length === 0) return res.status(400).json({ code: 'BAD_REQUEST', error: 'لازم تبعت messages' });
     const reply = await askGemini(messages);
     res.json({ reply });
   } catch (err) {
-    console.error('❌ [AI Error]', err.message);
-
-    if (err.message === 'ALL_KEYS_BUSY') {
-      return res.status(503).json({
-        code: 'ALL_KEYS_BUSY',
-        error: 'كل المفاتيح مشغولة دلوقتي، جرب تاني بعد دقيقة',
-      });
-    }
-    if (err.message?.includes('API key') || err.message?.includes('403')) {
-      return res
-        .status(500)
-        .json({ code: 'BAD_KEY', error: 'مفتاح Gemini غلط أو منتهي' });
-    }
-    if (err.message?.includes('429') || err.message?.includes('quota')) {
-      return res
-        .status(429)
-        .json({ code: 'RATE_LIMIT', error: 'الحد المسموح خلص، جرب بعد شوية' });
-    }
-    res
-      .status(500)
-      .json({ code: 'SERVER_ERROR', error: err.message || 'حصلت مشكلة' });
+    console.error('❌ [AI]', err.message);
+    if (err.message === 'ALL_KEYS_BUSY') return res.status(503).json({ code: 'ALL_KEYS_BUSY', error: 'جرب تاني بعد دقيقة' });
+    res.status(500).json({ code: 'SERVER_ERROR', error: err.message || 'حصلت مشكلة' });
   }
 });
 
 /* ============================================================
-   🎓 مسار /api/generate-quiz — توليد امتحان من درس
+   🎓 /api/generate-quiz
    ============================================================ */
 app.post('/api/generate-quiz', async (req, res) => {
   try {
     const user = await verifyUser(req);
-    if (!user) {
-      return res.status(401).json({
-        code: 'LOGIN_REQUIRED',
-        error: 'سجّل دخولك الأول',
-      });
-    }
+    if (!user) return res.status(401).json({ code: 'LOGIN_REQUIRED', error: 'سجّل دخولك' });
+    const { lessonTitle, lessonDescription, questionsCount = 15, timeLimitMin = 10, maxAttempts = 1 } = req.body;
+    if (!lessonTitle) return res.status(400).json({ code: 'BAD_REQUEST', error: 'محتاج عنوان الدرس' });
 
-    const { lessonTitle, lessonDescription, lessonDuration } = req.body;
-
-    if (!lessonTitle) {
-      return res
-        .status(400)
-        .json({ code: 'BAD_REQUEST', error: 'محتاج عنوان الدرس' });
-    }
-
-    const prompt = `أنت مدرس إنجليزي محترف. اعمل امتحان قصير (5 أسئلة اختيار من متعدد) عن الدرس التالي:
+    const prompt = `أنت مدرس إنجليزي محترف. اعمل امتحان (${questionsCount} سؤال اختيار من متعدد) عن الدرس التالي:
 
 **عنوان الدرس:** ${lessonTitle}
 **الوصف:** ${lessonDescription || 'درس في اللغة الإنجليزية'}
-**المدة:** ${lessonDuration || 0} دقيقة
 
-**المطلوب:**
-- 5 أسئلة اختيار من متعدد.
-- 4 خيارات لكل سؤال.
-- تحديد الإجابة الصحيحة (رقم 0-3).
-- الأسئلة تكون متنوعة (قواعد، مفردات، فهم).
-
-⚠️ مهم جداً: رد بـ JSON بس، من غير أي كلام تاني أو شرح. الشكل بالظبط:
-
+⚠️ رد بـ JSON بس بالشكل:
 {
   "title_ar": "امتحان: اسم الدرس",
-  "questions": [
-    {
-      "question": "نص السؤال",
-      "options": ["خيار 1", "خيار 2", "خيار 3", "خيار 4"],
-      "correct": 0
-    },
-    {
-      "question": "نص السؤال التاني",
-      "options": ["خيار 1", "خيار 2", "خيار 3", "خيار 4"],
-      "correct": 2
-    }
-  ]
+  "questions": [{"question": "...", "options": ["...", "..."], "correct": 0}]
 }`;
 
     const reply = await askGemini([{ role: 'user', content: prompt }]);
-
-    /* نظّف الرد من أي markdown */
-    let cleanReply = reply
-      .replace(/```json/g, '')
-      .replace(/```/g, '')
-      .trim();
-
-    /* لو فيه نص قبل JSON، خد الجزء اللي فيه {} */
+    let cleanReply = reply.replace(/```json/g, '').replace(/```/g, '').trim();
     const jsonMatch = cleanReply.match(/\{[\s\S]*\}/);
     if (jsonMatch) cleanReply = jsonMatch[0];
-
     const quiz = JSON.parse(cleanReply);
-
-    if (!quiz.questions || !Array.isArray(quiz.questions)) {
-      throw new Error('الرد مش فيه questions');
-    }
-
-    res.json(quiz);
+    if (!quiz.questions || !Array.isArray(quiz.questions)) throw new Error('الرد مش فيه questions');
+    res.json({ ...quiz, time_limit_min: timeLimitMin, max_attempts: maxAttempts, questions_count: questionsCount });
   } catch (err) {
-    console.error('❌ [Generate Quiz]', err.message);
-    res.status(500).json({
-      code: 'SERVER_ERROR',
-      error: err.message || 'فشل توليد الامتحان',
-    });
+    console.error('❌ [Quiz]', err.message);
+    res.status(500).json({ code: 'SERVER_ERROR', error: err.message || 'فشل التوليد' });
   }
 });
 
 /* ============================================================
-   🏥 مسار /api/health — فحص الحالة
+   🎬 Google Drive — السيرفر الوسيط
    ============================================================ */
-app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    service: 'basetna-ai',
-    model: MODEL_NAME,
-    totalKeys: API_KEYS.length,
-    currentKey: keyManager.currentIndex + 1,
-    keysStatus: keyManager.getStatus(),
-    time: new Date().toISOString(),
+let drive = null;
+try {
+  const auth = new google.auth.GoogleAuth({
+    credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || '{}'),
+    scopes: ['https://www.googleapis.com/auth/drive.readonly'],
   });
+  drive = google.drive({ version: 'v3', auth });
+  console.log('✅ Google Drive جاهز');
+} catch (err) {
+  console.warn('⚠️ Google Drive مش مفعّل:', err.message);
+}
+
+const LESSONS = {
+  'lesson-1': 'PUT_DRIVE_FILE_ID_HERE',
+  'lesson-2': 'PUT_DRIVE_FILE_ID_HERE',
+};
+
+function requireLogin(req, res, next) {
+  next();
+}
+
+app.get('/api/stream/:lessonId', requireLogin, async (req, res) => {
+  if (!drive) return res.status(503).json({ error: 'Drive not configured' });
+  try {
+    const fileId = LESSONS[req.params.lessonId];
+    if (!fileId) return res.sendStatus(404);
+
+    const meta = await drive.files.get({ fileId, fields: 'size,mimeType' });
+    const size = Number(meta.data.size);
+    const mime = meta.data.mimeType || 'video/mp4';
+
+    let start = 0;
+    let end = size - 1;
+    const range = req.headers.range;
+    if (range) {
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      if (m && m[1] !== '') start = parseInt(m[1], 10);
+      if (m && m[2] !== '') end = Math.min(parseInt(m[2], 10), size - 1);
+      if (start > end || start >= size) return res.status(416).set('Content-Range', `bytes */${size}`).end();
+    }
+
+    const upstream = await drive.files.get(
+      { fileId, alt: 'media' },
+      { responseType: 'stream', headers: { Range: `bytes=${start}-${end}` } }
+    );
+
+    res.writeHead(range ? 206 : 200, {
+      'Content-Type': mime,
+      'Content-Length': end - start + 1,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'private, no-store',
+      'Content-Disposition': 'inline',
+      ...(range && { 'Content-Range': `bytes ${start}-${end}/${size}` }),
+    });
+    upstream.data.pipe(res);
+    req.on('close', () => upstream.data.destroy());
+  } catch (err) {
+    console.error(err.message);
+    if (!res.headersSent) res.sendStatus(500);
+  }
 });
 
 /* ============================================================
-   🚀 تشغيل السيرفر
+   🏥 /api/health
    ============================================================ */
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log('==============================================');
-  console.log('🖥️  بسّطنا الإنجليزي — السيرفر شغال');
-  console.log('==============================================');
-  console.log(`🌐 الموقع:     http://localhost:${PORT}`);
-  console.log(`🤖 المساعد:    http://localhost:${PORT}/api/ai`);
-  console.log(`🎓 الامتحانات: http://localhost:${PORT}/api/generate-quiz`);
-  console.log(`🏥 الحالة:     http://localhost:${PORT}/api/health`);
-  console.log(`🔑 المفاتيح:   ${API_KEYS.length} مفتاح`);
-  console.log(`🤖 الموديل:    ${MODEL_NAME}`);
-  console.log('==============================================');
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, service: 'basetna-server', model: MODEL_NAME, totalKeys: API_KEYS.length, drive: !!drive, time: new Date().toISOString() });
 });
+
+/* ============================================================
+   🚀 Vercel
+   ============================================================ */
+export default app;
+
+if (process.env.NODE_ENV !== 'production') {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`🖥️ السيرفر شغال على ${PORT}`));
+}
