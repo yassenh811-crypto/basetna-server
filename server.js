@@ -3,11 +3,10 @@
    ============================================================ */
 import express from 'express';
 import cors from 'cors';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
 
-// ✅ السماح بالاتصال من أي مكان (هيحل مشكلة CORS)
+// ✅ السماح بالاتصال من أي مكان (حل مشكلة CORS)
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
@@ -33,13 +32,12 @@ const API_KEYS = loadApiKeys();
 const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
 console.log(`🔑 عدد المفاتيح: ${API_KEYS.length}`);
-console.log(`🤖 الموديل: ${MODEL_NAME}`);
 
 // ============================================================
 // 🔐 Supabase
 // ============================================================
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wgostqkywpybmzgbyzeo.supabase.co';
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'sb_publishable_zx0zeWR2bpbmyO90oN-4ow_FxZCSPl8';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 async function verifyUser(req) {
   const authHeader = req.headers.authorization || '';
@@ -74,7 +72,6 @@ async function askGemini(messages) {
 
   let lastError = null;
 
-  // محاولة استخدام المفاتيح المتاحة
   for (const apiKey of API_KEYS) {
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
@@ -156,13 +153,7 @@ app.post('/api/generate-quiz', async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    ok: true, 
-    service: 'basetna-server', 
-    model: MODEL_NAME, 
-    totalKeys: API_KEYS.length, 
-    time: new Date().toISOString() 
-  });
+  res.json({ ok: true, service: 'basetna-server', model: MODEL_NAME, totalKeys: API_KEYS.length, time: new Date().toISOString() });
 });
 
 // ============================================================
